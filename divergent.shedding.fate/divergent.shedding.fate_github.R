@@ -2961,3 +2961,1928 @@ openxlsx::saveWorkbook(wb, OUT_XLSX, overwrite = TRUE)
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =========================================================
+# Fig S3: miRNA-hit enrichment in kidney late-shed vs late non-shed
+# Panel A: Murine miRNAs (true_rev_rnahybrid...)
+# Panel B: muPyV miRNA  (true.muPyV_rev_rnahybrid...)
+# Per-mouse (no pooled panel)
+# Saves to: ../plots/urine_tissue_manuscript5/FigS3_miRNA_hit_enrichment_twoPanels.pdf
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(patchwork)
+})
+
+SAVE_DIR <- "../plots/urine_tissue_manuscript5"
+dir.create(SAVE_DIR, showWarnings = FALSE, recursive = TRUE)
+
+LAST_K <- 2
+
+# ---- Your two RNAhybrid inputs ----
+rnahybrid_tsv_mouse <- "/stor/work/Sullivan/anik/barcode_project/data/mirna_target_kidney/analysis.rnahybrid/rev_rnahybrid/true_rev_rnahybrid.kidney_mirna.parsed.tsv"
+rnahybrid_tsv_muPyV <- "/stor/work/Sullivan/anik/barcode_project/data/mirna_target_kidney/analysis.rnahybrid/rev_rnahybrid/true.muPyV_rev_rnahybrid.kidney_mirna.parsed.tsv"
+
+fasta_with_rev <- "/stor/work/Sullivan/anik/barcode_project/data/mirna_target_kidney/analysis.rnahybrid/rev_rnahybrid/kidney_barcodes_unique_with_rev.fa"
+
+is_kidney <- function(x) grepl("kidney|renal", x, ignore.case = TRUE)
+
+# ---- fixed colors for miRNA-hit vs random ----
+fill_colors <- c(
+  "miRNA-hit"      = "#3C8DBC",   # blue-ish
+  "Random control" = "#7F7F7F"    # gray
+)
+
+# =========================================================
+# Helpers
+# =========================================================
+read_fasta_named <- function(path) {
+  lines <- readLines(path)
+  hdr_idx <- grep("^>", lines)
+  ends <- c(hdr_idx[-1] - 1, length(lines))
+  tibble(
+    name = sub("^>", "", lines[hdr_idx]),
+    seq  = purrr::map2_chr(hdr_idx + 1, ends, ~ gsub("\\s+", "", paste(lines[.x:.y], collapse = "")))
+  )
+}
+
+panel_title_theme <- theme(
+  plot.title = element_text(face = "plain", size = 10, hjust = 0.5),
+  plot.title.position = "plot"
+)
+
+# =========================================================
+# Build kidney status table ONCE (Late-shed vs Late non-shed)
+# =========================================================
+last_k_days <- urine_bc_levels %>%
+  distinct(animal, Days_pi) %>%
+  group_by(animal) %>%
+  arrange(Days_pi, .by_group = TRUE) %>%
+  slice_tail(n = LAST_K) %>%
+  mutate(in_lastK = TRUE) %>%
+  ungroup()
+
+present_lastK <- urine_bc_levels %>%
+  inner_join(last_k_days, by = c("animal","Days_pi")) %>%
+  group_by(animal, barcode) %>%
+  summarise(present_lastK = any(bc_level > 0, na.rm = TRUE), .groups = "drop") %>%
+  filter(present_lastK) %>%
+  select(animal, barcode)
+
+kidney_barcodes_all <- tissue_bc_levels %>%
+  filter(is_kidney(organ)) %>%
+  distinct(animal, barcode)
+
+kidney_late_shed_set <- kidney_barcodes_all %>%
+  semi_join(present_lastK, by = c("animal","barcode")) %>%
+  mutate(kidney_status = "Late-shed")
+
+kidney_late_non_shed_set <- kidney_barcodes_all %>%
+  anti_join(present_lastK, by = c("animal","barcode")) %>%
+  mutate(kidney_status = "Late non-shed")
+
+kidney_status_tbl <- bind_rows(kidney_late_shed_set, kidney_late_non_shed_set) %>%
+  mutate(kidney_status = factor(kidney_status, levels = c("Late-shed", "Late non-shed")))
+
+# =========================================================
+# FASTA mapping table ONCE
+# =========================================================
+fasta_tbl <- read_fasta_named(fasta_with_rev)
+
+forward_seq_tbl <- fasta_tbl %>%
+  mutate(forward_name = sub("-rev$", "", name)) %>%
+  group_by(forward_name) %>%
+  summarise(forward_seq = seq[which.min(grepl("-rev$", name))], .groups = "drop")
+
+# =========================================================
+# Core function: given RNAhybrid TSV -> make per-mouse barplot
+# =========================================================
+make_mirna_enrichment_plot <- function(rnahybrid_tsv, panel_title, seed = 42) {
+  
+  miRNA_interaction <- readr::read_tsv(rnahybrid_tsv, show_col_types = FALSE) %>%
+    mutate(mirna_number = as.integer(stringr::str_extract(mirna, "\\d+"))) %>%
+    filter(!is.na(mirna_number), mirna_number >= 1, mirna_number <= 800) %>%
+    mutate(
+      barcode_id_raw  = target,
+      barcode_id_norm = sub("-rev$", "", barcode_id_raw)
+    ) %>%
+    left_join(forward_seq_tbl, by = c("barcode_id_norm" = "forward_name"))
+  
+  # miRNA-hit barcode set = unique forward_seq observed in RNAhybrid hits
+  mirna_hit_barcodes <- miRNA_interaction %>%
+    distinct(forward_seq) %>%
+    rename(barcode = forward_seq) %>%
+    filter(!is.na(barcode), barcode != "")
+  
+  mirna_hit_in_kidney <- kidney_status_tbl %>%
+    semi_join(mirna_hit_barcodes, by = "barcode")
+  
+  # matched random control per mouse (same n as miRNA hits in that mouse)
+  set.seed(seed)
+  hits_per_mouse <- mirna_hit_in_kidney %>%
+    count(animal, name = "n_hits")
+  
+  rand_control_by_mouse <- kidney_barcodes_all %>%
+    group_split(animal) %>%
+    purrr::map_dfr(function(df_mouse) {
+      this_animal <- df_mouse$animal[1]
+      n_hits <- hits_per_mouse %>% filter(animal == this_animal) %>% pull(n_hits)
+      n_hits <- ifelse(length(n_hits) == 0 || is.na(n_hits) || n_hits <= 0, 0, n_hits)
+      
+      if (n_hits == 0) return(tibble(animal = this_animal, barcode = character(0)))
+      
+      df_mouse %>%
+        slice_sample(n = min(n_hits, nrow(df_mouse))) %>%
+        select(animal, barcode)
+    })
+  
+  rand_in_kidney_status <- kidney_status_tbl %>%
+    semi_join(rand_control_by_mouse, by = c("animal","barcode"))
+  
+  summarize_status <- function(tbl, label) {
+    tbl %>%
+      count(animal, kidney_status, name = "n") %>%
+      group_by(animal) %>%
+      mutate(
+        n_total = sum(n),
+        prop    = ifelse(n_total > 0, n / n_total, NA_real_)
+      ) %>%
+      ungroup() %>%
+      mutate(group = label)
+  }
+  
+  hit_summary  <- summarize_status(mirna_hit_in_kidney, "miRNA-hit")
+  rand_summary <- summarize_status(rand_in_kidney_status, "Random control")
+  
+  plot_df <- bind_rows(hit_summary, rand_summary) %>%
+    mutate(
+      group = factor(group, levels = c("Random control", "miRNA-hit"))
+    )
+  
+  ggplot(plot_df, aes(x = kidney_status, y = prop, fill = group)) +
+    geom_col(position = position_dodge(width = 0.6), width = 0.55) +
+    facet_wrap(vars(animal), nrow = 1) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+    scale_fill_manual(values = fill_colors, drop = FALSE) +
+    labs(
+      title = panel_title,
+      x = "",
+      y = "Proportion of kidney barcodes",
+      fill = ""
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 0, hjust = 0.5),
+      panel.grid.major.x = element_blank(),
+      legend.position = "top"
+    ) +
+    panel_title_theme
+}
+
+# =========================================================
+# Build panels
+# =========================================================
+p_A <- make_mirna_enrichment_plot(
+  rnahybrid_tsv = rnahybrid_tsv_mouse,
+  panel_title   = "Murine miRNAs: kidney status of miRNA-hit barcodes vs random control"
+)
+
+p_B <- make_mirna_enrichment_plot(
+  rnahybrid_tsv = rnahybrid_tsv_muPyV,
+  panel_title   = "muPyV miRNA: kidney status of miRNA-hit barcodes vs random control"
+)
+
+figS3_panel <- p_A / p_B +
+  plot_layout(heights = c(1, 1)) +
+  plot_annotation(tag_levels = "A") &
+  theme(
+    plot.tag = element_text(face = "bold", size = 12),
+    plot.tag.position = c(0.0, 1.02)
+  )
+
+print(figS3_panel)
+
+ggsave(
+  filename = "FigS3_miRNA_hit_enrichment_twoPanels.pdf",
+  plot     = figS3_panel,
+  path     = SAVE_DIR,
+  width    = 11,
+  height   = 8
+)
+
+
+# ---- INPUT ----
+# Your tibble is assumed to be called `cutoff_99pct_stock_barcodes`
+# with a column named `barcode`
+
+out_dir  <- "/stor/work/Sullivan/anik/barcode_project/data/mirna_target_kidney/analysis.rnahybrid/analysis_7feb26"
+out_fa   <- file.path(out_dir, "cutoff_99pct_stock_barcodes.fa")
+
+# ---- MAKE FASTA ----
+con <- file(out_fa, open = "w")
+
+for (i in seq_len(nrow(cutoff_99pct_stock_barcodes))) {
+  bc_seq <- cutoff_99pct_stock_barcodes$barcode[i]
+  bc_name <- paste0("barcode", i)
+  
+  writeLines(paste0(">", bc_name), con)
+  writeLines(bc_seq, con)
+}
+
+close(con)
+
+# ---- CONFIRM ----
+cat("FASTA written to:\n", out_fa, "\n")
+
+
+
+
+
+
+
+#######miRNA
+
+library(readr)
+
+dir <- "/stor/work/Sullivan/anik/barcode_project/data/mirna_target_kidney/analysis.rnahybrid/analysis_7feb26"
+
+# mmu
+seed6_mmu <- read_tsv(
+  file.path(dir, "seedmatch_mmu_seed6_cutoffFile.tsv"),
+  show_col_types = FALSE
+)
+
+seed7_mmu <- read_tsv(
+  file.path(dir, "seedmatch_mmu_seed7_cutoffFile.tsv"),
+  show_col_types = FALSE
+)
+
+seed8_mmu <- read_tsv(
+  file.path(dir, "seedmatch_mmu_seed8_cutoffFile.tsv"),
+  show_col_types = FALSE
+)
+
+# muPyV
+seed6_muPyV <- read_tsv(
+  file.path(dir, "seedmatch_muPyV_seed6_cutoffFile.tsv"),
+  show_col_types = FALSE
+)
+
+seed7_muPyV <- read_tsv(
+  file.path(dir, "seedmatch_muPyV_seed7_cutoffFile.tsv"),
+  show_col_types = FALSE
+)
+
+seed8_muPyV <- read_tsv(
+  file.path(dir, "seedmatch_muPyV_seed8_cutoffFile.tsv"),
+  show_col_types = FALSE
+)
+
+
+
+
+#Get the set of barcodes from the seed table
+
+
+seed_barcodes <- seed7_mmu %>%
+  distinct(original_barcode_seq)
+
+#2⃣ Find matching rows in urine
+
+urine_hits <- urine_bc_levels %>%
+  filter(bc_level > 0) %>%
+  inner_join(
+    seed_barcodes,
+    by = c("barcode" = "original_barcode_seq")
+  )
+
+
+
+#3 Find matching rows in tissue
+tissue_hits_kidney <- tissue_bc_levels %>%
+  filter(
+    organ == "Kidney",
+    bc_level > 0
+  ) %>%
+  inner_join(
+    seed_barcodes,
+    by = c("barcode" = "original_barcode_seq")
+  )
+
+
+
+View(tissue_hits_kidney)
+
+View(urine_hits)
+
+
+
+library(dplyr)
+
+
+# ============================================================
+# Seed6 miRNA hit analysis (mouse-by-mouse)
+# - Late-shed vs Late non-shed kidney barcodes
+# - Unweighted (presence/absence per barcode)
+# - Abundance-weighted (kidney bc_level)
+# ============================================================
+
+library(dplyr)
+
+# ------------------------------------------------------------
+# 1) Define seed6 hit sets (>=1 hit per barcode)
+# ------------------------------------------------------------
+
+hits_muPyV_seed6 <- seed6_muPyV %>%
+  distinct(original_barcode_seq) %>%
+  rename(barcode = original_barcode_seq) %>%
+  mutate(hit_muPyV_seed6 = TRUE)
+
+hits_mmu_seed6 <- seed6_mmu %>%
+  distinct(original_barcode_seq) %>%
+  rename(barcode = original_barcode_seq) %>%
+  mutate(hit_mmu_seed6 = TRUE)
+
+# ------------------------------------------------------------
+# 2) Unweighted: fraction of barcodes with >=1 seed6 hit
+#    (per mouse, per Late-shed / Late non-shed group)
+# ------------------------------------------------------------
+
+presence_by_mouse_muPyV_seed6 <- kidney_classified %>%
+  left_join(hits_muPyV_seed6, by = "barcode") %>%
+  mutate(hit_muPyV_seed6 = if_else(is.na(hit_muPyV_seed6), FALSE, hit_muPyV_seed6)) %>%
+  group_by(animal, status) %>%
+  summarise(
+    n_barcodes = n(),
+    n_hit = sum(hit_muPyV_seed6),
+    pct_hit = n_hit / n_barcodes,
+    .groups = "drop"
+  )
+
+presence_by_mouse_mmu_seed6 <- kidney_classified %>%
+  left_join(hits_mmu_seed6, by = "barcode") %>%
+  mutate(hit_mmu_seed6 = if_else(is.na(hit_mmu_seed6), FALSE, hit_mmu_seed6)) %>%
+  group_by(animal, status) %>%
+  summarise(
+    n_barcodes = n(),
+    n_hit = sum(hit_mmu_seed6),
+    pct_hit = n_hit / n_barcodes,
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 3) Prepare kidney abundance (bc_level) per mouse x barcode
+# ------------------------------------------------------------
+
+kidney_abundance <- tissue_bc_levels %>%
+  filter(is_kidney(organ), bc_level > 0) %>%
+  group_by(animal, barcode) %>%
+  summarise(kidney_bc_level = sum(bc_level, na.rm = TRUE), .groups = "drop")
+
+kidney_classified_abund <- kidney_classified %>%
+  left_join(kidney_abundance, by = c("animal", "barcode"))
+
+# ------------------------------------------------------------
+# 4) Abundance-weighted: fraction of kidney bc_level
+#    carried by seed6-hit barcodes (per mouse, per group)
+# ------------------------------------------------------------
+
+weighted_by_mouse_muPyV_seed6 <- kidney_classified_abund %>%
+  left_join(hits_muPyV_seed6, by = "barcode") %>%
+  mutate(
+    hit_muPyV_seed6 = if_else(is.na(hit_muPyV_seed6), FALSE, hit_muPyV_seed6),
+    kidney_bc_level = if_else(is.na(kidney_bc_level), 0, kidney_bc_level)
+  ) %>%
+  group_by(animal, status) %>%
+  summarise(
+    total_kidney_bc_level = sum(kidney_bc_level),
+    hit_kidney_bc_level   = sum(kidney_bc_level[hit_muPyV_seed6]),
+    pct_kidney_bc_level_hit = hit_kidney_bc_level / total_kidney_bc_level,
+    .groups = "drop"
+  )
+
+weighted_by_mouse_mmu_seed6 <- kidney_classified_abund %>%
+  left_join(hits_mmu_seed6, by = "barcode") %>%
+  mutate(
+    hit_mmu_seed6 = if_else(is.na(hit_mmu_seed6), FALSE, hit_mmu_seed6),
+    kidney_bc_level = if_else(is.na(kidney_bc_level), 0, kidney_bc_level)
+  ) %>%
+  group_by(animal, status) %>%
+  summarise(
+    total_kidney_bc_level = sum(kidney_bc_level),
+    hit_kidney_bc_level   = sum(kidney_bc_level[hit_mmu_seed6]),
+    pct_kidney_bc_level_hit = hit_kidney_bc_level / total_kidney_bc_level,
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 5) Outputs now available:
+# ------------------------------------------------------------
+presence_by_mouse_muPyV_seed6
+presence_by_mouse_mmu_seed6
+weighted_by_mouse_muPyV_seed6
+weighted_by_mouse_mmu_seed6
+
+
+
+
+
+
+
+
+# ============================================================
+# Seed7 miRNA hit analysis (mouse-by-mouse)
+# - Late-shed vs Late non-shed kidney barcodes
+# - Unweighted (presence/absence per barcode)
+# - Abundance-weighted (kidney bc_level)
+# ============================================================
+
+library(dplyr)
+
+# ------------------------------------------------------------
+# 1) Define seed7 hit sets (>=1 hit per barcode)
+# ------------------------------------------------------------
+
+hits_muPyV_seed7 <- seed7_muPyV %>%
+  distinct(original_barcode_seq) %>%
+  rename(barcode = original_barcode_seq) %>%
+  mutate(hit_muPyV_seed7 = TRUE)
+
+hits_mmu_seed7 <- seed7_mmu %>%
+  distinct(original_barcode_seq) %>%
+  rename(barcode = original_barcode_seq) %>%
+  mutate(hit_mmu_seed7 = TRUE)
+
+# ------------------------------------------------------------
+# 2) Unweighted: fraction of barcodes with >=1 seed7 hit
+#    (per mouse, per Late-shed / Late non-shed group)
+# ------------------------------------------------------------
+
+presence_by_mouse_muPyV_seed7 <- kidney_classified %>%
+  left_join(hits_muPyV_seed7, by = "barcode") %>%
+  mutate(hit_muPyV_seed7 = if_else(is.na(hit_muPyV_seed7), FALSE, hit_muPyV_seed7)) %>%
+  group_by(animal, status) %>%
+  summarise(
+    n_barcodes = n(),
+    n_hit = sum(hit_muPyV_seed7),
+    pct_hit = n_hit / n_barcodes,
+    .groups = "drop"
+  )
+
+presence_by_mouse_mmu_seed7 <- kidney_classified %>%
+  left_join(hits_mmu_seed7, by = "barcode") %>%
+  mutate(hit_mmu_seed7 = if_else(is.na(hit_mmu_seed7), FALSE, hit_mmu_seed7)) %>%
+  group_by(animal, status) %>%
+  summarise(
+    n_barcodes = n(),
+    n_hit = sum(hit_mmu_seed7),
+    pct_hit = n_hit / n_barcodes,
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 3) Prepare kidney abundance (bc_level) per mouse x barcode
+#    (reuses kidney_abundance + kidney_classified_abund if already made)
+# ------------------------------------------------------------
+
+if (!exists("kidney_abundance")) {
+  kidney_abundance <- tissue_bc_levels %>%
+    filter(is_kidney(organ), bc_level > 0) %>%
+    group_by(animal, barcode) %>%
+    summarise(kidney_bc_level = sum(bc_level, na.rm = TRUE), .groups = "drop")
+}
+
+if (!exists("kidney_classified_abund")) {
+  kidney_classified_abund <- kidney_classified %>%
+    left_join(kidney_abundance, by = c("animal", "barcode"))
+}
+
+# ------------------------------------------------------------
+# 4) Abundance-weighted: fraction of kidney bc_level
+#    carried by seed7-hit barcodes (per mouse, per group)
+# ------------------------------------------------------------
+
+weighted_by_mouse_muPyV_seed7 <- kidney_classified_abund %>%
+  left_join(hits_muPyV_seed7, by = "barcode") %>%
+  mutate(
+    hit_muPyV_seed7 = if_else(is.na(hit_muPyV_seed7), FALSE, hit_muPyV_seed7),
+    kidney_bc_level = if_else(is.na(kidney_bc_level), 0, kidney_bc_level)
+  ) %>%
+  group_by(animal, status) %>%
+  summarise(
+    total_kidney_bc_level = sum(kidney_bc_level),
+    hit_kidney_bc_level   = sum(kidney_bc_level[hit_muPyV_seed7]),
+    pct_kidney_bc_level_hit = hit_kidney_bc_level / total_kidney_bc_level,
+    .groups = "drop"
+  )
+
+weighted_by_mouse_mmu_seed7 <- kidney_classified_abund %>%
+  left_join(hits_mmu_seed7, by = "barcode") %>%
+  mutate(
+    hit_mmu_seed7 = if_else(is.na(hit_mmu_seed7), FALSE, hit_mmu_seed7),
+    kidney_bc_level = if_else(is.na(kidney_bc_level), 0, kidney_bc_level)
+  ) %>%
+  group_by(animal, status) %>%
+  summarise(
+    total_kidney_bc_level = sum(kidney_bc_level),
+    hit_kidney_bc_level   = sum(kidney_bc_level[hit_mmu_seed7]),
+    pct_kidney_bc_level_hit = hit_kidney_bc_level / total_kidney_bc_level,
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 5) Outputs now available:
+# ------------------------------------------------------------
+presence_by_mouse_muPyV_seed7
+presence_by_mouse_mmu_seed7
+weighted_by_mouse_muPyV_seed7
+weighted_by_mouse_mmu_seed7
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# Seed7 host miRNA analysis restricted to kidney-enriched miRNAs
+# - Unweighted and abundance-weighted analyses
+# - Mouse-by-mouse, Late-shed vs Late non-shed
+# ============================================================
+
+library(dplyr)
+
+# ------------------------------------------------------------
+# 1) Define kidney-enriched / kidney-relevant murine miRNAs
+# ------------------------------------------------------------
+
+kidney_mmu_mirnas <- c(
+  "mmu-miR-192-5p",
+  "mmu-miR-194-5p",
+  "mmu-miR-204-5p",
+  "mmu-miR-215-5p",
+  "mmu-miR-30a-5p",
+  "mmu-miR-30b-5p",
+  "mmu-miR-30c-5p",
+  "mmu-miR-30d-5p",
+  "mmu-miR-30e-5p",
+  "mmu-miR-21-5p",
+  "mmu-miR-146a-5p",
+  "mmu-miR-155-5p"
+)
+
+
+# df <- read.delim("/stor/work/Sullivan/anik/barcode_project/data/mirna_target_kidney/analysis.rnahybrid/analysis_7feb26/PNAS2020_miRNA_atlas/pnas.2002277117.sd02.tsv",
+#                  check.names = FALSE,
+#                  stringsAsFactors = FALSE)
+# 
+# names(df)[ncol(df)] <- "biotype"
+# 
+# mir <- df[df$biotype == "miRNA", , drop = FALSE]
+# 
+# kidney_cols <- grep("^Kidney_", names(mir), value = TRUE)
+# 
+# mir$kidney_mean <- rowMeans(mir[, kidney_cols, drop = FALSE], na.rm = TRUE)
+# 
+# kidney_abundant <- mir[order(mir$kidney_mean, decreasing = TRUE),
+#                        c("kidney_mean", kidney_cols)]
+# 
+# head(kidney_abundant, 50)
+# 
+# # ============================================================
+# # Filter seed7_mmu to only miRNAs in top-50 kidney-abundant atlas list
+# # (handles naming differences between Mir10b vs mmu-miR-10b-5p)
+# # ============================================================
+# 
+# library(dplyr)
+# library(stringr)
+# 
+# # ---- 1) Get top 50 kidney-abundant miRNAs from your atlas result ----
+# top50_atlas <- rownames(head(kidney_abundant, 50))   # e.g., "Mir10b", "Mir26a.2", ...
+# 
+# # ---- 2) Make a comparable "key" for atlas names ----
+# atlas_to_key <- function(x) {
+#   x %>%
+#     tolower() %>%
+#     str_replace("^mir", "mir") %>%      # keep mir prefix stable
+#     str_replace_all("\\.", "-") %>%     # Mir26a.2 -> Mir26a-2
+#     str_replace_all("[^a-z0-9]", "")    # remove punctuation: mir26a-2 -> mir26a2
+# }
+# 
+# top50_keys <- atlas_to_key(top50_atlas)
+# 
+# # ---- 3) Make a comparable "key" for seed7_mmu matched_miRNA ----
+# mirbase_to_key <- function(x) {
+#   x %>%
+#     tolower() %>%
+#     str_replace("^mmu-", "") %>%                         # drop species prefix
+#     str_replace("-(3p|5p)$", "") %>%                     # drop arm if present at end
+#     str_replace_all("[^a-z0-9]", "")                     # remove punctuation
+# }
+# 
+# seed7_mmu_tagged <- seed7_mmu %>%
+#   mutate(
+#     matched_miRNA_key = mirbase_to_key(matched_miRNA)
+#   )
+# 
+# # ---- 4) Filter seed7_mmu to matches ----
+# seed7_mmu_top50kidney <- seed7_mmu_tagged %>%
+#   filter(matched_miRNA_key %in% top50_keys)
+# 
+# # ---- 5) Sanity checks: which atlas miRNAs didn’t match anything? ----
+# matched_keys_in_seed <- unique(seed7_mmu_tagged$matched_miRNA_key)
+# unmatched_atlas <- top50_atlas[!(top50_keys %in% matched_keys_in_seed)]
+# 
+# cat("Top50 atlas miRNAs:", length(top50_atlas), "\n")
+# cat("Rows retained from seed7_mmu:", nrow(seed7_mmu_top50kidney), "\n")
+# cat("Atlas miRNAs with no direct match in seed7_mmu (check naming):\n")
+# print(unmatched_atlas)
+# 
+# # ---- Output object ----
+# seed7_mmu_top50kidney
+library(readxl)
+library(dplyr)
+
+# Load the scaled miRNA file
+df <- read_xlsx("/stor/work/Sullivan/anik/barcode_project/data/mirna_target_kidney/analysis.rnahybrid/analysis_7feb26/PNAS2020_miRNA_atlas/pnas.2002277117.sd04.xlsx")
+
+# Filter: only Kidney rows
+kidney_miR <- df %>%
+  filter(Tissue == "Kidney")
+
+# Select miRNA and mean scaled expression
+kidney_ranked <- kidney_miR %>%
+  select(miRNA, `Mean scaled expression *`) %>%
+  arrange(desc(`Mean scaled expression *`))
+
+# Print top 50 (or remove head() to show all)
+head(kidney_ranked, 50)
+top50_miRs <- kidney_ranked$miRNA[1:100]
+
+# 5) Filter your seed7_mmu table by these miRNAs
+# Adjust "miRNA" column name below if your table uses something like "miRNA_name"
+seed7_mmu_kidney <- seed7_mmu %>%
+  filter(matched_miRNA %in% top50_miRs)
+seed7_mmu_kidney
+
+# ------------------------------------------------------------
+# 2) Subset seed7 mmu hits to kidney-relevant miRNAs only
+# ------------------------------------------------------------
+
+#seed7_mmu_kidney <- seed7_mmu %>%
+#  filter(matched_miRNA %in% kidney_mmu_mirnas)
+#seed7_mmu_kidney <- seed7_mmu_top50kidney
+# ------------------------------------------------------------
+# 3) Define barcode hit set (>=1 kidney-miRNA seed match)
+# ------------------------------------------------------------
+
+hits_mmu_seed7_kidney <- seed7_mmu_kidney %>%
+  distinct(original_barcode_seq) %>%
+  rename(barcode = original_barcode_seq) %>%
+  mutate(hit_mmu_seed7_kidney = TRUE)
+
+# ------------------------------------------------------------
+# 4) Unweighted analysis:
+#    Fraction of kidney barcodes with kidney-miRNA seed matches
+# ------------------------------------------------------------
+
+presence_by_mouse_mmu_seed7_kidney <- kidney_classified %>%
+  left_join(hits_mmu_seed7_kidney, by = "barcode") %>%
+  mutate(
+    hit_mmu_seed7_kidney = if_else(
+      is.na(hit_mmu_seed7_kidney),
+      FALSE,
+      hit_mmu_seed7_kidney
+    )
+  ) %>%
+  group_by(animal, status) %>%
+  summarise(
+    n_barcodes = n(),
+    n_hit = sum(hit_mmu_seed7_kidney),
+    pct_hit = n_hit / n_barcodes,
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 5) Abundance-weighted analysis:
+#    Fraction of kidney viral abundance in kidney-miRNA-hit barcodes
+# ------------------------------------------------------------
+
+weighted_by_mouse_mmu_seed7_kidney <- kidney_classified_abund %>%
+  left_join(hits_mmu_seed7_kidney, by = "barcode") %>%
+  mutate(
+    hit_mmu_seed7_kidney = if_else(
+      is.na(hit_mmu_seed7_kidney),
+      FALSE,
+      hit_mmu_seed7_kidney
+    ),
+    kidney_bc_level = if_else(is.na(kidney_bc_level), 0, kidney_bc_level)
+  ) %>%
+  group_by(animal, status) %>%
+  summarise(
+    total_kidney_bc_level = sum(kidney_bc_level),
+    hit_kidney_bc_level   = sum(kidney_bc_level[hit_mmu_seed7_kidney]),
+    pct_kidney_bc_level_hit =
+      hit_kidney_bc_level / total_kidney_bc_level,
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 6) Outputs
+# ------------------------------------------------------------
+
+presence_by_mouse_mmu_seed7_kidney
+weighted_by_mouse_mmu_seed7_kidney
+
+
+
+
+
+
+
+library(openxlsx)
+
+# Create a new Excel workbook
+wb <- createWorkbook()
+
+# -----------------------------
+# Sheet 1: Unweighted muPyV seed7
+# -----------------------------
+addWorksheet(wb, "muPyV_seed7_unweighted")
+writeData(
+  wb,
+  sheet = "muPyV_seed7_unweighted",
+  x = presence_by_mouse_muPyV_seed7,
+  startRow = 1,
+  startCol = 1
+)
+
+# -----------------------------
+# Sheet 2: Unweighted mmu seed7
+# -----------------------------
+addWorksheet(wb, "mmu_seed7_unweighted")
+writeData(
+  wb,
+  sheet = "mmu_seed7_unweighted",
+  x = presence_by_mouse_mmu_seed7,
+  startRow = 1,
+  startCol = 1
+)
+
+# -----------------------------
+# Sheet 3: Weighted muPyV seed7
+# -----------------------------
+addWorksheet(wb, "muPyV_seed7_weighted")
+writeData(
+  wb,
+  sheet = "muPyV_seed7_weighted",
+  x = weighted_by_mouse_muPyV_seed7,
+  startRow = 1,
+  startCol = 1
+)
+
+# -----------------------------
+# Sheet 4: Weighted mmu seed7
+# -----------------------------
+addWorksheet(wb, "mmu_seed7_weighted")
+writeData(
+  wb,
+  sheet = "mmu_seed7_weighted",
+  x = weighted_by_mouse_mmu_seed7,
+  startRow = 1,
+  startCol = 1
+)
+
+saveWorkbook(
+  wb,
+  file = "Seed7_miRNA_hit_summary_tables.xlsx",
+  overwrite = TRUE
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# Seed7 plots + unified controls
+# Panels:
+# A) Unweighted pct_hit per mouse (mmu vs muPyV)
+# B) Weighted pct_kidney_bc_level_hit per mouse (mmu vs muPyV)
+# C) mmu control: length+GC-matched resampling null (violin behind points)
+# D) muPyV control: permutation null for "# hit barcodes in Late-shed"
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(stringr)
+
+set.seed(1)
+
+# -----------------------------
+# 0) Hit sets (seed7)
+# -----------------------------
+hits_muPyV_seed7 <- seed7_muPyV %>%
+  distinct(original_barcode_seq) %>%
+  rename(barcode = original_barcode_seq) %>%
+  mutate(hit_muPyV = TRUE)
+
+hits_mmu_seed7 <- seed7_mmu %>%
+  distinct(original_barcode_seq) %>%
+  rename(barcode = original_barcode_seq) %>%
+  mutate(hit_mmu = TRUE)
+
+# -----------------------------
+# 1) Kidney abundance per mouse x barcode (bc_level)
+# -----------------------------
+kidney_abundance <- tissue_bc_levels %>%
+  filter(is_kidney(organ), bc_level > 0) %>%
+  group_by(animal, barcode) %>%
+  summarise(kidney_bc_level = sum(bc_level, na.rm = TRUE), .groups = "drop")
+
+# -----------------------------
+# 2) Master table: one row per mouse x barcode in kidney_classified
+#    Includes status, kidney_bc_level, hit flags, length + GC
+# -----------------------------
+barcode_master_seed7 <- kidney_classified %>%
+  left_join(kidney_abundance, by = c("animal", "barcode")) %>%
+  left_join(hits_mmu_seed7, by = "barcode") %>%
+  left_join(hits_muPyV_seed7, by = "barcode") %>%
+  mutate(
+    kidney_bc_level = if_else(is.na(kidney_bc_level), 0, kidney_bc_level),
+    hit_mmu  = if_else(is.na(hit_mmu), FALSE, hit_mmu),
+    hit_muPyV = if_else(is.na(hit_muPyV), FALSE, hit_muPyV),
+    len = nchar(barcode),
+    gc  = (str_count(barcode, "[Gg]") + str_count(barcode, "[Cc]")) / pmax(len, 1)
+  )
+
+# -----------------------------
+# 3) Panel A + B observed summaries (per mouse, per status)
+# -----------------------------
+obs_unweighted <- barcode_master_seed7 %>%
+  group_by(animal, status) %>%
+  summarise(
+    pct_hit_mmu   = mean(hit_mmu),
+    pct_hit_muPyV = mean(hit_muPyV),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = starts_with("pct_hit_"),
+               names_to = "dataset",
+               values_to = "pct_hit") %>%
+  mutate(dataset = recode(dataset,
+                          pct_hit_mmu = "mmu",
+                          pct_hit_muPyV = "muPyV"))
+
+obs_weighted <- barcode_master_seed7 %>%
+  group_by(animal, status) %>%
+  summarise(
+    pct_weighted_mmu = if_else(sum(kidney_bc_level) > 0,
+                               sum(kidney_bc_level[hit_mmu]) / sum(kidney_bc_level),
+                               NA_real_),
+    pct_weighted_muPyV = if_else(sum(kidney_bc_level) > 0,
+                                 sum(kidney_bc_level[hit_muPyV]) / sum(kidney_bc_level),
+                                 NA_real_),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = starts_with("pct_weighted_"),
+               names_to = "dataset",
+               values_to = "pct_weighted") %>%
+  mutate(dataset = recode(dataset,
+                          pct_weighted_mmu = "mmu",
+                          pct_weighted_muPyV = "muPyV"))
+
+# -----------------------------
+# 4) Helper: length+GC binning for matched resampling (mmu control)
+#    - length bins: exact length
+#    - GC bins: 5 bins within each mouse (quantile-based)
+# -----------------------------
+master_for_null <- barcode_master_seed7 %>%
+  group_by(animal) %>%
+  mutate(
+    gc_bin = ntile(gc, 5),
+    len_bin = len
+  ) %>%
+  ungroup()
+
+# Stratified sample: for a given mouse & status target,
+# sample from same mouse pool matching counts per (len_bin, gc_bin).
+stratified_sample <- function(pool_df, target_df, strata = c("len_bin", "gc_bin")) {
+  target_counts <- target_df %>%
+    count(across(all_of(strata)), name = "n_target")
+  
+  sampled <- target_counts %>%
+    group_split(across(all_of(strata))) %>%
+    map_dfr(function(one_stratum) {
+      n_take <- one_stratum$n_target[1]
+      # values for this stratum
+      st_vals <- one_stratum %>% select(all_of(strata)) %>% slice(1)
+      
+      candidates <- pool_df
+      for (s in strata) {
+        candidates <- candidates %>% filter(.data[[s]] == st_vals[[s]][1])
+      }
+      
+      # If not enough candidates in this stratum, sample with replacement as fallback
+      if (nrow(candidates) == 0) {
+        return(pool_df %>% slice_sample(n = n_take, replace = TRUE))
+      } else if (nrow(candidates) < n_take) {
+        return(candidates %>% slice_sample(n = n_take, replace = TRUE))
+      } else {
+        return(candidates %>% slice_sample(n = n_take, replace = FALSE))
+      }
+    })
+  
+  sampled
+}
+
+# -----------------------------
+# 5) Panel C: mmu null distributions (length+GC-matched)
+#    Build null for BOTH unweighted and weighted metrics
+# -----------------------------
+N_REP <- 2000  # increase if you want smoother violins
+
+make_mmu_null <- function(animal_id, status_level) {
+  pool <- master_for_null %>% filter(animal == animal_id)
+  target <- pool %>% filter(status == status_level)
+  
+  # if target is empty, skip
+  if (nrow(target) == 0) return(NULL)
+  
+  reps <- map_dfr(seq_len(N_REP), function(i) {
+    samp <- stratified_sample(pool, target, strata = c("len_bin", "gc_bin"))
+    
+    tibble(
+      animal = animal_id,
+      status = status_level,
+      rep = i,
+      pct_hit = mean(samp$hit_mmu),
+      pct_weighted = if_else(sum(samp$kidney_bc_level) > 0,
+                             sum(samp$kidney_bc_level[samp$hit_mmu]) / sum(samp$kidney_bc_level),
+                             NA_real_)
+    )
+  })
+  reps
+}
+
+animals <- sort(unique(master_for_null$animal))
+statuses <- levels(master_for_null$status)
+
+mmu_null <- map_dfr(animals, function(a) {
+  map_dfr(statuses, function(s) make_mmu_null(a, s))
+})
+
+# -----------------------------
+# 6) Panel D: muPyV permutation null
+#    For each mouse: null distribution of "# muPyV-hit barcodes in Late-shed"
+# -----------------------------
+N_PERM <- 20000
+
+# muPyV_perm <- map_dfr(animals, function(a) {
+#   pool <- barcode_master_seed7 %>% filter(animal == a)
+#   target <- pool %>% filter(status == "Late-shed")
+#   
+#   n_target <- nrow(target)
+#   if (n_target == 0) return(NULL)
+#   
+#   obs_hits <- sum(target$hit_muPyV)
+#   
+#   null_hits <- replicate(N_PERM, {
+#     samp_idx <- sample.int(nrow(pool), size = n_target, replace = FALSE)
+#     sum(pool$hit_muPyV[samp_idx])
+#   })
+#   
+#   tibble(
+#     animal = a,
+#     obs_hits = obs_hits,
+#     null_hits = null_hits
+#   )
+# })
+# 
+# muPyV_perm_pvals <- muPyV_perm %>%
+#   group_by(animal) %>%
+#   summarise(
+#     obs_hits = first(obs_hits),
+#     p_null_le_obs = mean(null_hits <= obs_hits),   # for depletion (obs small)
+#     p_null_eq_obs = mean(null_hits == obs_hits),   # probability of exact 0 etc.
+#     .groups = "drop"
+#   )
+# 
+# print(muPyV_perm_pvals)
+
+# -----------------------------
+# 7) Plotting
+# -----------------------------
+
+# Panel A: Unweighted pct_hit (observed)
+pA <- ggplot(obs_unweighted, aes(x = status, y = pct_hit, group = animal)) +
+  geom_line(alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ dataset, scales = "free_y") +
+  labs(x = NULL, y = "Unweighted fraction of barcodes with seed7 hit") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+# Panel B: Weighted pct_hit (observed)
+pB <- ggplot(obs_weighted, aes(x = status, y = pct_weighted, group = animal)) +
+  geom_line(alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ dataset, scales = "free_y") +
+  labs(x = NULL, y = "Weighted fraction of kidney bc_level in seed7-hit barcodes") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+# Panel C: mmu control violins behind observed points (unweighted + weighted)
+# Unweighted mmu control
+pC1 <- ggplot() +
+  geom_violin(
+    data = mmu_null,
+    aes(x = status, y = pct_hit),
+    trim = TRUE
+  ) +
+  geom_point(
+    data = obs_unweighted %>% filter(dataset == "mmu"),
+    aes(x = status, y = pct_hit, group = animal),
+    size = 2
+  ) +
+  geom_line(
+    data = obs_unweighted %>% filter(dataset == "mmu"),
+    aes(x = status, y = pct_hit, group = animal),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ animal) +
+  labs(x = NULL, y = "mmu: unweighted pct_hit (obs over null)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+# Weighted mmu control
+pC2 <- ggplot() +
+  geom_violin(
+    data = mmu_null,
+    aes(x = status, y = pct_weighted),
+    trim = TRUE
+  ) +
+  geom_point(
+    data = obs_weighted %>% filter(dataset == "mmu"),
+    aes(x = status, y = pct_weighted, group = animal),
+    size = 2
+  ) +
+  geom_line(
+    data = obs_weighted %>% filter(dataset == "mmu"),
+    aes(x = status, y = pct_weighted, group = animal),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ animal) +
+  labs(x = NULL, y = "mmu: weighted pct_hit (obs over null)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+# Panel D: muPyV null distribution (# hits in Late-shed), per mouse
+pD <- ggplot(muPyV_perm, aes(x = null_hits)) +
+  geom_histogram(bins = 30) +
+  geom_vline(
+    data = muPyV_perm_pvals,
+    aes(xintercept = obs_hits),
+    linewidth = 1
+  ) +
+  facet_wrap(~ animal, scales = "free_y") +
+  labs(x = "# muPyV seed7-hit barcodes in Late-shed (null)", y = "Count") +
+  theme_classic()
+
+
+
+# -----------------------------
+# 5b) muPyV null distributions (length+GC-matched)
+#     Same as mmu_null, but using hit_muPyV
+# -----------------------------
+make_muPyV_null <- function(animal_id, status_level) {
+  pool <- master_for_null %>% filter(animal == animal_id)
+  target <- pool %>% filter(status == status_level)
+  
+  if (nrow(target) == 0) return(NULL)
+  
+  reps <- map_dfr(seq_len(N_REP), function(i) {
+    samp <- stratified_sample(pool, target, strata = c("len_bin", "gc_bin"))
+    
+    tibble(
+      animal = animal_id,
+      status = status_level,
+      rep = i,
+      pct_hit = mean(samp$hit_muPyV),
+      pct_weighted = if_else(sum(samp$kidney_bc_level) > 0,
+                             sum(samp$kidney_bc_level[samp$hit_muPyV]) / sum(samp$kidney_bc_level),
+                             NA_real_)
+    )
+  })
+  reps
+}
+
+muPyV_null <- map_dfr(animals, function(a) {
+  map_dfr(statuses, function(s) make_muPyV_null(a, s))
+})
+
+
+# Panel C3: muPyV control violins behind observed points (unweighted)
+pC3 <- ggplot() +
+  geom_violin(
+    data = muPyV_null,
+    aes(x = status, y = pct_hit),
+    trim = TRUE
+  ) +
+  geom_point(
+    data = obs_unweighted %>% filter(dataset == "muPyV"),
+    aes(x = status, y = pct_hit, group = animal),
+    size = 2
+  ) +
+  geom_line(
+    data = obs_unweighted %>% filter(dataset == "muPyV"),
+    aes(x = status, y = pct_hit, group = animal),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ animal) +
+  labs(x = NULL, y = "muPyV: unweighted pct_hit (obs over null)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+# Panel C4: muPyV control violins behind observed points (weighted)
+pC4 <- ggplot() +
+  geom_violin(
+    data = muPyV_null,
+    aes(x = status, y = pct_weighted),
+    trim = TRUE
+  ) +
+  geom_point(
+    data = obs_weighted %>% filter(dataset == "muPyV"),
+    aes(x = status, y = pct_weighted, group = animal),
+    size = 2
+  ) +
+  geom_line(
+    data = obs_weighted %>% filter(dataset == "muPyV"),
+    aes(x = status, y = pct_weighted, group = animal),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ animal) +
+  labs(x = NULL, y = "muPyV: weighted pct_hit (obs over null)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+
+# Print plots
+print(pA)
+print(pB)
+print(pC1)
+print(pC2)
+print(pC3)
+print(pC4)
+
+print(pD)
+
+pC1 <- ggplot() +
+  geom_violin(
+    data = mmu_null,
+    aes(x = status, y = pct_hit),
+    trim = TRUE
+  ) +
+  geom_point(
+    data = obs_unweighted %>% filter(dataset == "mmu"),
+    aes(x = status, y = pct_hit, group = animal),
+    size = 2
+  ) +
+  geom_line(
+    data = obs_unweighted %>% filter(dataset == "mmu"),
+    aes(x = status, y = pct_hit, group = animal),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ animal) +
+  labs(
+    x = NULL,
+    y = "Fraction of kidney barcodes\nwith host miRNA seed match",
+    title = "A. Host miRNA seed targeting in kidney barcodes\n  (Observed vs Null distribution)"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+
+pC2 <- ggplot() +
+  geom_violin(
+    data = mmu_null,
+    aes(x = status, y = pct_weighted),
+    trim = TRUE
+  ) +
+  geom_point(
+    data = obs_weighted %>% filter(dataset == "mmu"),
+    aes(x = status, y = pct_weighted, group = animal),
+    size = 2
+  ) +
+  geom_line(
+    data = obs_weighted %>% filter(dataset == "mmu"),
+    aes(x = status, y = pct_weighted, group = animal),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ animal) +
+  labs(
+    x = NULL,
+    y = "Fraction of kidney viral abundance in \n host miRNA seed targeted barcodes",
+    title = "B. Host miRNA seed targeting weighted by kidney barcode levels\n  (Observed vs Null distribution)"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+
+print(pC1)
+print(pC2)
+library(patchwork)
+
+pC1/pC2
+
+
+library(patchwork)
+
+ggsave(
+  filename = "../plots/urine_tissue_manuscript5/mmu_seed7_observed_vs_null.pdf",
+  plot = pC1 / pC2,
+  width = 6.3,
+  height = 8,
+  units = "in"
+)
+
+
+
+
+
+barcode_master_seed7 %>% count(animal, status)
+barcode_master_seed7 %>% summarise(min_len=min(len), max_len=max(len))
+barcode_master_seed7 %>% group_by(animal) %>% summarise(n_hit_muPyV=sum(hit_muPyV), n_hit_mmu=sum(hit_mmu))
+
+
+
+
+scale_def_colors <- scale_fill_manual(values = c(
+  "Late-shed" = "#F8766D",
+  "Late non-shed" = "#00BFC4"
+))
+
+scale_def_colors_lines <- scale_color_manual(values = c(
+  "Late-shed" = "#F8766D",
+  "Late non-shed" = "#00BFC4"
+))
+pC1 <- ggplot() +
+  geom_violin(
+    data = mmu_null,
+    aes(x = status, y = pct_hit, fill = status),
+    trim = TRUE,
+    alpha = 0.4
+  ) +
+  geom_point(
+    data = obs_unweighted %>% filter(dataset == "mmu"),
+    aes(x = status, y = pct_hit, group = animal, color = status),
+    size = 2
+  ) +
+  geom_line(
+    data = obs_unweighted %>% filter(dataset == "mmu"),
+    aes(x = status, y = pct_hit, group = animal, color = status),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ animal) +
+  labs(
+    x = NULL,
+    y = "Fraction of kidney barcodes\nwith host miRNA seed match",
+    title = "A. Host miRNA seed targeting in kidney barcodes\n(Observed vs null distribution)"
+  ) +
+  scale_def_colors +
+  scale_def_colors_lines +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    legend.position = "none"
+  )
+
+pC2 <- ggplot() +
+  geom_violin(
+    data = mmu_null,
+    aes(x = status, y = pct_weighted, fill = status),
+    trim = TRUE,
+    alpha = 0.4
+  ) +
+  geom_point(
+    data = obs_weighted %>% filter(dataset == "mmu"),
+    aes(x = status, y = pct_weighted, group = animal, color = status),
+    size = 2
+  ) +
+  geom_line(
+    data = obs_weighted %>% filter(dataset == "mmu"),
+    aes(x = status, y = pct_weighted, group = animal, color = status),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ animal) +
+  labs(
+    x = NULL,
+    y = "Fraction of kidney viral abundance in\nhost miRNA seed–targeted barcodes",
+    title = "B. Host miRNA seed targeting weighted by kidney barcode levels\n(Observed vs null distribution)"
+  ) +
+  scale_def_colors +
+  scale_def_colors_lines +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    legend.position = "none"
+  )
+
+
+
+
+
+
+
+###
+# ============================================================
+# Seed7 (Top-50 kidney-abundant host miRNAs) observed vs null
+# - Unweighted + abundance-weighted (mouse-by-mouse)
+# - Length + GC–matched resampling null (N_REP simulations)
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(stringr)
+library(patchwork)
+
+set.seed(1)
+
+# -----------------------------
+# 0) Hit set: seed7 hits restricted to top-50 kidney-abundant host miRNAs
+#    (expects you already created: hits_mmu_seed7_kidney with column barcode + hit_mmu_seed7_kidney)
+# -----------------------------
+# If not already defined earlier in your session, uncomment and use:
+# hits_mmu_seed7_kidney <- seed7_mmu_kidney %>%
+#   distinct(original_barcode_seq) %>%
+#   rename(barcode = original_barcode_seq) %>%
+#   mutate(hit_mmu_seed7_kidney = TRUE)
+
+# -----------------------------
+# 1) Kidney abundance per mouse x barcode (bc_level)
+# -----------------------------
+kidney_abundance <- tissue_bc_levels %>%
+  filter(is_kidney(organ), bc_level > 0) %>%
+  group_by(animal, barcode) %>%
+  summarise(kidney_bc_level = sum(bc_level, na.rm = TRUE), .groups = "drop")
+
+# -----------------------------
+# 2) Master table: one row per mouse x barcode in kidney_classified
+#    Includes status, kidney_bc_level, hit flag, length + GC
+# -----------------------------
+barcode_master_seed7_kidneyMiR <- kidney_classified %>%
+  left_join(kidney_abundance, by = c("animal", "barcode")) %>%
+  left_join(hits_mmu_seed7_kidney, by = "barcode") %>%
+  mutate(
+    kidney_bc_level = if_else(is.na(kidney_bc_level), 0, kidney_bc_level),
+    hit_mmu_kidneyMiR = if_else(is.na(hit_mmu_seed7_kidney), FALSE, hit_mmu_seed7_kidney),
+    len = nchar(barcode),
+    gc  = (str_count(barcode, "[Gg]") + str_count(barcode, "[Cc]")) / pmax(len, 1)
+  )
+
+# -----------------------------
+# 3) Observed summaries (per mouse, per status)
+# -----------------------------
+obs_unweighted_kidneyMiR <- barcode_master_seed7_kidneyMiR %>%
+  group_by(animal, status) %>%
+  summarise(
+    pct_hit = mean(hit_mmu_kidneyMiR),
+    .groups = "drop"
+  )
+
+obs_weighted_kidneyMiR <- barcode_master_seed7_kidneyMiR %>%
+  group_by(animal, status) %>%
+  summarise(
+    pct_weighted = if_else(sum(kidney_bc_level) > 0,
+                           sum(kidney_bc_level[hit_mmu_kidneyMiR]) / sum(kidney_bc_level),
+                           NA_real_),
+    .groups = "drop"
+  )
+
+# -----------------------------
+# 4) Helper: length+GC binning for matched resampling
+#    - length bins: exact length
+#    - GC bins: 5 bins within each mouse (quantile-based)
+# -----------------------------
+master_for_null_kidneyMiR <- barcode_master_seed7_kidneyMiR %>%
+  group_by(animal) %>%
+  mutate(
+    gc_bin  = ntile(gc, 5),
+    len_bin = len
+  ) %>%
+  ungroup()
+
+# Stratified sample: for a given mouse & status target,
+# sample from same mouse pool matching counts per (len_bin, gc_bin).
+stratified_sample <- function(pool_df, target_df, strata = c("len_bin", "gc_bin")) {
+  target_counts <- target_df %>%
+    count(across(all_of(strata)), name = "n_target")
+  
+  sampled <- target_counts %>%
+    group_split(across(all_of(strata))) %>%
+    map_dfr(function(one_stratum) {
+      n_take <- one_stratum$n_target[1]
+      st_vals <- one_stratum %>% select(all_of(strata)) %>% slice(1)
+      
+      candidates <- pool_df
+      for (s in strata) {
+        candidates <- candidates %>% filter(.data[[s]] == st_vals[[s]][1])
+      }
+      
+      if (nrow(candidates) == 0) {
+        pool_df %>% slice_sample(n = n_take, replace = TRUE)
+      } else if (nrow(candidates) < n_take) {
+        candidates %>% slice_sample(n = n_take, replace = TRUE)
+      } else {
+        candidates %>% slice_sample(n = n_take, replace = FALSE)
+      }
+    })
+  
+  sampled
+}
+
+# -----------------------------
+# 5) Null distributions (length+GC-matched)
+#    Build null for BOTH unweighted and weighted metrics
+# -----------------------------
+N_REP <- 2000  # increase for smoother violins
+
+make_mmu_null_kidneyMiR <- function(animal_id, status_level) {
+  pool   <- master_for_null_kidneyMiR %>% filter(animal == animal_id)
+  target <- pool %>% filter(status == status_level)
+  if (nrow(target) == 0) return(NULL)
+  
+  map_dfr(seq_len(N_REP), function(i) {
+    samp <- stratified_sample(pool, target, strata = c("len_bin", "gc_bin"))
+    tibble(
+      animal = animal_id,
+      status = status_level,
+      rep = i,
+      pct_hit = mean(samp$hit_mmu_kidneyMiR),
+      pct_weighted = if_else(sum(samp$kidney_bc_level) > 0,
+                             sum(samp$kidney_bc_level[samp$hit_mmu_kidneyMiR]) / sum(samp$kidney_bc_level),
+                             NA_real_)
+    )
+  })
+}
+
+animals  <- sort(unique(master_for_null_kidneyMiR$animal))
+statuses <- levels(master_for_null_kidneyMiR$status)
+
+mmu_null_kidneyMiR <- map_dfr(animals, function(a) {
+  map_dfr(statuses, function(s) make_mmu_null_kidneyMiR(a, s))
+})
+
+# -----------------------------
+# 6) Plots: observed points/lines over null violins
+# -----------------------------
+pKidneyMiR_C1 <- ggplot() +
+  geom_violin(
+    data = mmu_null_kidneyMiR,
+    aes(x = status, y = pct_hit),
+    trim = TRUE
+  ) +
+  geom_point(
+    data = obs_unweighted_kidneyMiR,
+    aes(x = status, y = pct_hit, group = animal),
+    size = 2
+  ) +
+  geom_line(
+    data = obs_unweighted_kidneyMiR,
+    aes(x = status, y = pct_hit, group = animal),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ animal) +
+  labs(
+    x = NULL,
+    y = "Fraction of kidney barcodes\nwith seed match to top kidney-abundant host miRNAs",
+    title = "A. Host miRNA seed targeting (top kidney-abundant miRNAs)\n  (Observed vs null expectation)"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+pKidneyMiR_C2 <- ggplot() +
+  geom_violin(
+    data = mmu_null_kidneyMiR,
+    aes(x = status, y = pct_weighted),
+    trim = TRUE
+  ) +
+  geom_point(
+    data = obs_weighted_kidneyMiR,
+    aes(x = status, y = pct_weighted, group = animal),
+    size = 2
+  ) +
+  geom_line(
+    data = obs_weighted_kidneyMiR,
+    aes(x = status, y = pct_weighted, group = animal),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ animal) +
+  labs(
+    x = NULL,
+    y = "Fraction of kidney viral abundance in\nbarcodes seed-matched to top kidney-abundant host miRNAs",
+    title = "B. Host miRNA seed targeting weighted by kidney barcode levels\n  (Observed vs null expectation)"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+# View
+print(pKidneyMiR_C1)
+print(pKidneyMiR_C2)
+
+# Single page (2 rows)
+pKidneyMiR_C1 / pKidneyMiR_C2
+
+# Save PDF
+ggsave(
+  filename = "../plots/urine_tissue_manuscript5/mmu_seed7_top50KidneyMiRs_observed_vs_null.pdf",
+  plot = pKidneyMiR_C1 / pKidneyMiR_C2,
+  width = 6.3,
+  height = 8,
+  units = "in"
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#####top100
+
+
+# ============================================================
+# Seed7 – TOP 100 kidney-abundant host miRNAs
+# Observed vs length+GC-matched null distributions
+# Mouse-by-mouse analysis (Late-shed vs Late non-shed)
+# ============================================================
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(stringr)
+library(patchwork)
+
+set.seed(1)
+
+# -----------------------------
+# 1) Load kidney miRNA atlas + define TOP_N
+# -----------------------------
+
+TOP_N <- 100
+
+df <- read_xlsx("/stor/work/Sullivan/anik/barcode_project/data/mirna_target_kidney/analysis.rnahybrid/analysis_7feb26/PNAS2020_miRNA_atlas/pnas.2002277117.sd04.xlsx")
+
+kidney_ranked <- df %>%
+  filter(Tissue == "Kidney") %>%
+  select(miRNA, `Mean scaled expression *`) %>%
+  arrange(desc(`Mean scaled expression *`))
+
+top100_miRs <- kidney_ranked$miRNA[1:TOP_N]
+
+# -----------------------------
+# 2) Filter seed7_mmu to TOP 100 kidney-abundant miRNAs
+# -----------------------------
+
+seed7_mmu_top100 <- seed7_mmu %>%
+  filter(matched_miRNA %in% top100_miRs)
+
+hits_mmu_seed7_top100 <- seed7_mmu_top100 %>%
+  distinct(original_barcode_seq) %>%
+  rename(barcode = original_barcode_seq) %>%
+  mutate(hit_mmu_seed7_top100 = TRUE)
+
+# -----------------------------
+# 3) Kidney abundance per mouse x barcode
+# -----------------------------
+
+kidney_abundance <- tissue_bc_levels %>%
+  filter(is_kidney(organ), bc_level > 0) %>%
+  group_by(animal, barcode) %>%
+  summarise(kidney_bc_level = sum(bc_level, na.rm = TRUE), .groups = "drop")
+
+# -----------------------------
+# 4) Master table
+# -----------------------------
+
+barcode_master_top100 <- kidney_classified %>%
+  left_join(kidney_abundance, by = c("animal", "barcode")) %>%
+  left_join(hits_mmu_seed7_top100, by = "barcode") %>%
+  mutate(
+    kidney_bc_level = if_else(is.na(kidney_bc_level), 0, kidney_bc_level),
+    hit_top100 = if_else(is.na(hit_mmu_seed7_top100), FALSE, hit_mmu_seed7_top100),
+    len = nchar(barcode),
+    gc  = (str_count(barcode, "[Gg]") + str_count(barcode, "[Cc]")) / pmax(len, 1)
+  )
+
+# -----------------------------
+# 5) Observed summaries
+# -----------------------------
+
+obs_unweighted_top100 <- barcode_master_top100 %>%
+  group_by(animal, status) %>%
+  summarise(
+    pct_hit = mean(hit_top100),
+    .groups = "drop"
+  )
+
+obs_weighted_top100 <- barcode_master_top100 %>%
+  group_by(animal, status) %>%
+  summarise(
+    pct_weighted = if_else(sum(kidney_bc_level) > 0,
+                           sum(kidney_bc_level[hit_top100]) / sum(kidney_bc_level),
+                           NA_real_),
+    .groups = "drop"
+  )
+
+# -----------------------------
+# 6) Length + GC matched null distributions
+# -----------------------------
+
+master_for_null_top100 <- barcode_master_top100 %>%
+  group_by(animal) %>%
+  mutate(
+    gc_bin = ntile(gc, 5),
+    len_bin = len
+  ) %>%
+  ungroup()
+
+stratified_sample <- function(pool_df, target_df, strata = c("len_bin", "gc_bin")) {
+  target_counts <- target_df %>%
+    count(across(all_of(strata)), name = "n_target")
+  
+  target_counts %>%
+    group_split(across(all_of(strata))) %>%
+    map_dfr(function(one_stratum) {
+      n_take <- one_stratum$n_target[1]
+      st_vals <- one_stratum %>% select(all_of(strata)) %>% slice(1)
+      
+      candidates <- pool_df
+      for (s in strata) {
+        candidates <- candidates %>% filter(.data[[s]] == st_vals[[s]][1])
+      }
+      
+      if (nrow(candidates) == 0) {
+        pool_df %>% slice_sample(n = n_take, replace = TRUE)
+      } else if (nrow(candidates) < n_take) {
+        candidates %>% slice_sample(n = n_take, replace = TRUE)
+      } else {
+        candidates %>% slice_sample(n = n_take, replace = FALSE)
+      }
+    })
+}
+
+N_REP <- 2000
+
+make_null_top100 <- function(animal_id, status_level) {
+  pool <- master_for_null_top100 %>% filter(animal == animal_id)
+  target <- pool %>% filter(status == status_level)
+  if (nrow(target) == 0) return(NULL)
+  
+  map_dfr(seq_len(N_REP), function(i) {
+    samp <- stratified_sample(pool, target)
+    tibble(
+      animal = animal_id,
+      status = status_level,
+      rep = i,
+      pct_hit = mean(samp$hit_top100),
+      pct_weighted = if_else(sum(samp$kidney_bc_level) > 0,
+                             sum(samp$kidney_bc_level[samp$hit_top100]) /
+                               sum(samp$kidney_bc_level),
+                             NA_real_)
+    )
+  })
+}
+
+animals <- sort(unique(master_for_null_top100$animal))
+statuses <- levels(master_for_null_top100$status)
+
+null_top100 <- map_dfr(animals, function(a) {
+  map_dfr(statuses, function(s) make_null_top100(a, s))
+})
+
+# -----------------------------
+# 7) Plots
+# -----------------------------
+
+p1_top100 <- ggplot() +
+  geom_violin(data = null_top100,
+              aes(x = status, y = pct_hit),
+              trim = TRUE) +
+  geom_point(data = obs_unweighted_top100,
+             aes(x = status, y = pct_hit, group = animal),
+             size = 2) +
+  geom_line(data = obs_unweighted_top100,
+            aes(x = status, y = pct_hit, group = animal),
+            alpha = 0.6) +
+  facet_wrap(~ animal) +
+  labs(
+    x = NULL,
+    y = "Fraction of kidney barcodes with seed match\nto top kidney-abundant host miRNAs",
+    title = "A. Host miRNA seed targeting (top 100 kidney-abundant miRNAs)\n  (Observed vs null expectation)"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+p2_top100 <- ggplot() +
+  geom_violin(data = null_top100,
+              aes(x = status, y = pct_weighted),
+              trim = TRUE) +
+  geom_point(data = obs_weighted_top100,
+             aes(x = status, y = pct_weighted, group = animal),
+             size = 2) +
+  geom_line(data = obs_weighted_top100,
+            aes(x = status, y = pct_weighted, group = animal),
+            alpha = 0.6) +
+  facet_wrap(~ animal) +
+  labs(
+    x = NULL,
+    y = "Fraction of kidney viral abundance in barcodes\nseed-matched to top kidney-abundant host miRNAs",
+    title = "B. Host miRNA seed targeting weighted by kidney barcode levels\n  (Observed vs null expectation)"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+
+
+
+scale_def_colors <- scale_fill_manual(values = c(
+  "Late-shed" = "#F8766D",
+  "Late non-shed" = "#00BFC4"
+))
+
+scale_def_colors_line <- scale_color_manual(values = c(
+  "Late-shed" = "#F8766D",
+  "Late non-shed" = "#00BFC4"
+))
+
+# -----------------------------
+# Panel A (Unweighted)
+# -----------------------------
+p1_top100 <- ggplot() +
+  geom_violin(
+    data = null_top100,
+    aes(x = status, y = pct_hit, fill = status),
+    trim = TRUE,
+    alpha = 0.6,
+    color = NA
+  ) +
+  geom_point(
+    data = obs_unweighted_top100,
+    aes(x = status, y = pct_hit, group = animal, color = status),
+    size = 2
+  ) +
+  geom_line(
+    data = obs_unweighted_top100,
+    aes(x = status, y = pct_hit, group = animal, color = status),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ animal) +
+  scale_def_colors +
+  scale_def_colors_line +
+  labs(
+    x = NULL,
+    y = "Fraction of kidney barcodes with seed match\nto top kidney-abundant host miRNAs",
+    title = "A. Host miRNA seed targeting (top 100 kidney-abundant miRNAs)\n  (Observed vs null expectation)"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1),
+        legend.position = "none")
+
+
+# -----------------------------
+# Panel B (Weighted)
+# -----------------------------
+p2_top100 <- ggplot() +
+  geom_violin(
+    data = null_top100,
+    aes(x = status, y = pct_weighted, fill = status),
+    trim = TRUE,
+    alpha = 0.6,
+    color = NA
+  ) +
+  geom_point(
+    data = obs_weighted_top100,
+    aes(x = status, y = pct_weighted, group = animal, color = status),
+    size = 2
+  ) +
+  geom_line(
+    data = obs_weighted_top100,
+    aes(x = status, y = pct_weighted, group = animal, color = status),
+    alpha = 0.6
+  ) +
+  facet_wrap(~ animal) +
+  scale_def_colors +
+  scale_def_colors_line +
+  labs(
+    x = NULL,
+    y = "Fraction of kidney viral abundance in barcodes\nseed-matched to top kidney-abundant host miRNAs",
+    title = "B. Host miRNA seed targeting weighted by kidney barcode levels\n  (Observed vs null expectation)"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1),
+        legend.position = "none")
+
+
+combined_plot_top100 <- p1_top100 / p2_top100
+
+print(combined_plot_top100)
+
+# -----------------------------
+# 8) Save to separate folder
+# -----------------------------
+
+#dir.create("../plots/urine_tissue_manuscript5/top100_analysis", showWarnings = FALSE)
+
+ggsave(
+  filename = "../plots/urine_tissue_manuscript5/top100_analysis/mmu_seed7_top100_observed_vs_null2.pdf",
+  plot = combined_plot_top100,
+  width = 6.3,
+  height = 8,
+  units = "in"
+)
+
+
+# ============================================================
+# Export TOP100 kidney-miRNA seed7 summary tables to 1 Excel file (2 sheets)
+# ============================================================
+
+library(openxlsx)
+
+out_xlsx <- "../plots/urine_tissue_manuscript5/top100_analysis/mmu_seed7_top100_summary_tables.xlsx"
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "Unweighted_presence")
+writeDataTable(wb, "Unweighted_presence", presence_by_mouse_mmu_seed7_kidney)
+
+addWorksheet(wb, "Weighted_abundance")
+writeDataTable(wb, "Weighted_abundance", weighted_by_mouse_mmu_seed7_kidney)
+
+saveWorkbook(wb, out_xlsx, overwrite = TRUE)
+
+out_xlsx
+
+
+
+
